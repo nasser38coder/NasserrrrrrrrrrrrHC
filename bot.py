@@ -17,9 +17,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
+import cloudscraper
 import config
 import json
-import threading
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -70,7 +70,6 @@ class Database:
             )
         ''')
         self.conn.commit()
-        # التأكد من وجود سجل
         self.cursor.execute("SELECT COUNT(*) FROM account_creation_log")
         if self.cursor.fetchone()[0] == 0:
             self.cursor.execute("INSERT INTO account_creation_log (last_attempt, status) VALUES (?, ?)", 
@@ -102,7 +101,6 @@ class Database:
         return self.cursor.fetchall()
     
     def can_create_account(self):
-        """التحقق من إمكانية إنشاء حساب (مرة كل 24 ساعة)"""
         self.cursor.execute("SELECT last_attempt, status FROM account_creation_log ORDER BY id DESC LIMIT 1")
         result = self.cursor.fetchone()
         if not result:
@@ -110,20 +108,17 @@ class Database:
         last_attempt = datetime.fromisoformat(result[0])
         status = result[1]
         if status == 'success':
-            return False  # منع المحاولة بعد النجاح
-        # سماح بمحاولة واحدة كل 24 ساعة
+            return False
         if datetime.now() - last_attempt < timedelta(hours=24):
             return False
         return True
     
     def log_creation_attempt(self, status):
-        """تسجيل محاولة إنشاء حساب"""
         self.cursor.execute("UPDATE account_creation_log SET last_attempt = ?, status = ?", 
                            (datetime.now().isoformat(), status))
         self.conn.commit()
     
     def get_creation_status(self):
-        """الحصول على حالة إنشاء الحساب"""
         self.cursor.execute("SELECT last_attempt, status FROM account_creation_log ORDER BY id DESC LIMIT 1")
         result = self.cursor.fetchone()
         if result:
@@ -183,10 +178,11 @@ class TempEmail:
 
 class InstagramProfile:
     def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
         self.ua = UserAgent()
     
     def get_profile_info(self, username):
-        """جلب البروفايل من HTML مباشرة"""
+        """جلب البروفايل باستخدام cloudscraper + BeautifulSoup"""
         try:
             headers = {
                 'User-Agent': self.ua.random,
@@ -199,12 +195,12 @@ class InstagramProfile:
             }
             
             url = f"https://www.instagram.com/{username}/"
-            response = requests.get(url, headers=headers, timeout=10)
+            response = self.scraper.get(url, headers=headers, timeout=15)
             
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
+                soup = BeautifulSoup(response.text, 'lxml')
                 
-                # محاولة استخراج البيانات من script
+                # استخراج البيانات من script
                 scripts = soup.find_all('script')
                 for script in scripts:
                     if script.string and 'window._sharedData' in script.string:
@@ -232,8 +228,7 @@ class InstagramProfile:
                 img_tag = soup.find('img', {'alt': username})
                 if img_tag:
                     profile_pic = img_tag.get('src', '')
-                
-                return None
+            
             return None
         except Exception as e:
             logger.error(f"❌ فشل جلب البروفايل: {e}")
@@ -263,19 +258,15 @@ class InstagramCreator:
         }
     
     def create_account_with_email(self):
-        """إنشاء حساب واحد مع بريد مؤقت وتفعيل تلقائي"""
         try:
-            # التحقق من إمكانية الإنشاء
             if not db.can_create_account():
                 status = db.get_creation_status()
                 if status:
                     wait_time = 24 - (datetime.now() - status['last_attempt']).seconds // 3600
-                    return None, f"⚠️ يرجى الانتظار {wait_time} ساعة قبل المحاولة مرة أخرى"
+                    return None, f"⚠️ يرجى الانتظار {wait_time} ساعة"
             
-            # 1. توليد بيانات
             data = self.generate_random_data()
             
-            # 2. إنشاء بريد مؤقت
             temp_email = TempEmail()
             if not temp_email.create():
                 db.log_creation_attempt('failed')
@@ -283,7 +274,6 @@ class InstagramCreator:
             
             email = temp_email.email
             
-            # 3. إعداد المتصفح
             options = webdriver.ChromeOptions()
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
@@ -299,12 +289,10 @@ class InstagramCreator:
             driver = webdriver.Chrome(service=service, options=options)
             driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            # 4. فتح صفحة التسجيل
             driver.get("https://www.instagram.com/accounts/emailsignup/")
             time.sleep(3)
             wait = WebDriverWait(driver, 10)
             
-            # 5. ملء البيانات
             email_input = wait.until(EC.presence_of_element_located((By.NAME, "emailOrPhone")))
             email_input.send_keys(email)
             time.sleep(1)
@@ -325,7 +313,6 @@ class InstagramCreator:
             signup_button.click()
             time.sleep(5)
             
-            # 6. انتظار كود التفعيل
             code = temp_email.get_verification_code(max_wait=120)
             
             if not code:
@@ -333,7 +320,6 @@ class InstagramCreator:
                 db.log_creation_attempt('failed')
                 return None, "لم يتم استلام كود التفعيل"
             
-            # 7. إدخال كود التفعيل
             try:
                 code_input = wait.until(EC.presence_of_element_located((By.NAME, "code")))
                 code_input.send_keys(code)
@@ -343,17 +329,16 @@ class InstagramCreator:
                 verify_button.click()
                 time.sleep(5)
                 
-                # 8. حفظ الحساب
                 db.save_account(data['username'], data['password'], email)
                 db.log_creation_attempt('success')
                 
                 driver.quit()
-                return data, "✅ تم إنشاء الحساب وتفعيله بنجاح!"
+                return data, "✅ تم إنشاء الحساب وتفعيله!"
                 
             except Exception as e:
                 driver.quit()
                 db.log_creation_attempt('failed')
-                return None, f"فشل إدخال الكود: {e}"
+                return None, f"فشل إدخال الكود"
             
         except Exception as e:
             logger.error(f"❌ فشل إنشاء الحساب: {e}")
@@ -391,7 +376,6 @@ def start(update, context):
     keyboard = [
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("🔍 تحقق من حساب", callback_data="check_profile")],
-        [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
         [InlineKeyboardButton("🔧 إنشاء حساب مفعل", callback_data="create_accounts")],
         [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
         [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
@@ -399,15 +383,7 @@ def start(update, context):
     ]
     
     update.message.reply_text(
-        "👋 *مرحباً بك في بوت Nasser HC Pro!*\n\n"
-        "🤖 *الميزات:*\n"
-        "• 📝 إرسال بلاغات تلقائية\n"
-        "• 🔍 التحقق من حساب إنستغرام (HTML)\n"
-        "• 📧 إنشاء بريد مؤقت\n"
-        "• 🔧 إنشاء حساب مفعل (مرة كل 24 ساعة)\n"
-        "• 📤 عرض حساب عشوائي\n"
-        "• 📋 عرض الحسابات المخزنة\n"
-        "• 📊 متابعة بلاغاتك\n\n"
+        "👋 *مرحباً بك في بوت Nasser HC!*\n\n"
         "📌 *اختر أحد الأزرار:*",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -419,8 +395,7 @@ def report_start(update, context):
     query.answer()
     context.user_data['step'] = 'report_target'
     query.edit_message_text(
-        "✏️ *أرسل اسم المستخدم المستهدف:*\n"
-        "(بدون @)",
+        "✏️ *أرسل اسم المستخدم المستهدف:*",
         parse_mode='Markdown'
     )
 
@@ -430,84 +405,49 @@ def check_profile_start(update, context):
     query.answer()
     context.user_data['step'] = 'check_profile'
     query.edit_message_text(
-        "✏️ *أرسل اسم المستخدم للتحقق:*\n"
-        "(بدون @)",
+        "✏️ *أرسل اسم المستخدم للتحقق:*",
         parse_mode='Markdown'
     )
-
-
-def temp_email(update, context):
-    query = update.callback_query
-    query.answer()
-    email = TempEmail()
-    if email.create():
-        query.edit_message_text(
-            f"📧 *تم إنشاء بريدك المؤقت!*\n\n📨 البريد: `{email.email}`\n\n⏳ جاري انتظار كود التفعيل...",
-            parse_mode='Markdown'
-        )
-        code = email.get_verification_code(max_wait=90)
-        if code:
-            query.edit_message_text(
-                f"✅ *تم استلام كود التفعيل!*\n\n🔑 الكود: `{code}`\n\n📨 البريد: `{email.email}`",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
-                    [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
-                ])
-            )
-        else:
-            query.edit_message_text(
-                f"❌ *لم يتم استلام كود التفعيل*\n\n📨 البريد: `{email.email}`\n🔗 https://www.guerrillamail.com/inbox/{email.token}",
-                parse_mode='Markdown'
-            )
-    else:
-        query.edit_message_text("❌ *فشل إنشاء البريد*", parse_mode='Markdown')
 
 
 def create_accounts(update, context):
     query = update.callback_query
     query.answer()
     
-    # التحقق من إمكانية الإنشاء
     if not db.can_create_account():
         status = db.get_creation_status()
         if status:
             wait_time = 24 - (datetime.now() - status['last_attempt']).seconds // 3600
             query.edit_message_text(
-                f"⚠️ *لا يمكن إنشاء حساب جديد*\n\n"
-                f"📌 تم إنشاء حساب بالفعل.\n"
-                f"⏳ يرجى الانتظار {wait_time} ساعة للمحاولة مرة أخرى.",
+                f"⚠️ *انتظر {wait_time} ساعة*",
                 parse_mode='Markdown'
             )
             return
     
     query.edit_message_text(
-        "🔄 *جاري إنشاء حساب مفعل...*\n"
-        "⏳ قد يستغرق 2-5 دقائق",
+        "🔄 *جاري إنشاء حساب مفعل...*\n⏳ 2-5 دقائق",
         parse_mode='Markdown'
     )
     
-    # إنشاء حساب واحد
     account, msg = creator.create_account_with_email()
     
     if account:
         text = f"✅ *تم إنشاء حساب مفعل!*\n\n"
-        text += f"👤 المستخدم: `{account['username']}`\n"
-        text += f"🔑 كلمة المرور: `{account['password']}`\n"
-        text += f"📧 البريد: `{account['email']}`\n\n"
-        text += f"💡 سيتم استخدامه تلقائياً في الإبلاغ"
+        text += f"👤 `{account['username']}`\n"
+        text += f"🔑 `{account['password']}`\n"
+        text += f"📧 `{account['email']}`"
         
         query.edit_message_text(
             text,
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 عرض الحسابات", callback_data="my_accounts")],
+                [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
                 [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
             ])
         )
     else:
         query.edit_message_text(
-            f"❌ *فشل إنشاء الحساب*\n\n{msg}",
+            f"❌ *فشل*\n{msg}",
             parse_mode='Markdown'
         )
 
@@ -517,15 +457,14 @@ def random_account(update, context):
     query.answer()
     accounts = db.get_accounts()
     if not accounts:
-        query.edit_message_text("📭 *لا توجد حسابات مخزنة*", parse_mode='Markdown')
+        query.edit_message_text("📭 *لا توجد حسابات*", parse_mode='Markdown')
         return
     account = random.choice(accounts)
     query.edit_message_text(
-        f"🎲 *حساب عشوائي*\n\n👤 المستخدم: `{account[0]}`\n🔑 كلمة المرور: `{account[1]}`\n📧 البريد: `{account[2]}`",
+        f"🎲 *حساب عشوائي*\n\n👤 `{account[0]}`\n🔑 `{account[1]}`\n📧 `{account[2]}`",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🎲 عرض آخر", callback_data="random_account")],
-            [InlineKeyboardButton("📋 عرض الكل", callback_data="my_accounts")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
         ])
     )
@@ -536,13 +475,11 @@ def my_accounts(update, context):
     query.answer()
     accounts = db.get_accounts()
     if not accounts:
-        query.edit_message_text("📭 *لا توجد حسابات مخزنة*", parse_mode='Markdown')
+        query.edit_message_text("📭 *لا توجد حسابات*", parse_mode='Markdown')
         return
     text = "📋 *حساباتي*\n\n"
     for i, acc in enumerate(accounts[:10], 1):
-        text += f"{i}. 👤 `{acc[0]}`\n   📧 {acc[2]}\n\n"
-    if len(accounts) > 10:
-        text += f"*و {len(accounts)-10} حسابات أخرى*"
+        text += f"{i}. 👤 `{acc[0]}`\n"
     query.edit_message_text(text, parse_mode='Markdown')
 
 
@@ -557,9 +494,7 @@ def my_reports(update, context):
     text = "📊 *بلاغاتي*\n\n"
     for report in reports[:10]:
         status = "✅" if report[3] == "resolved" else "⏳"
-        text += f"{status} #{report[0]} - @{report[2]}\n   📅 {report[4]}\n\n"
-    if len(reports) > 10:
-        text += f"*و {len(reports)-10} بلاغات أخرى*"
+        text += f"{status} #{report[0]} - @{report[2]}\n"
     query.edit_message_text(text, parse_mode='Markdown')
 
 
@@ -579,32 +514,22 @@ def extract_username(text):
 def show_profile(update, context, target):
     profile = profile_fetcher.get_profile_info(target)
     if not profile:
-        update.message.reply_text(
-            "❌ *لا يمكن جلب معلومات البروفايل*\n"
-            "تأكد من صحة اسم المستخدم.",
-            parse_mode='Markdown'
-        )
+        update.message.reply_text("❌ *مفيش حساب*", parse_mode='Markdown')
         return
     
     text = f"📸 *معلومات البروفايل*\n\n"
-    text += f"👤 *المستخدم:* @{profile['username']}\n"
-    text += f"📛 *الاسم:* {profile['full_name']}\n"
-    text += f"📝 *البايو:* {profile['bio'][:100]}...\n"
-    text += f"👥 *متابعون:* {profile['follower_count']:,}\n"
-    text += f"📌 *متابعة:* {profile['following_count']:,}\n"
-    text += f"📷 *منشورات:* {profile['media_count']:,}\n"
-    text += f"🔒 *خاص:* {'✅' if profile['is_private'] else '❌'}\n"
-    text += f"✅ *موثق:* {'✅' if profile['is_verified'] else '❌'}\n"
-    if profile.get('profile_pic_url'):
-        text += f"\n🖼️ [صورة البروفايل]({profile['profile_pic_url']})"
-    
-    text += f"\n\n❓ *هل هذا هو الحساب المستهدف؟*"
+    text += f"👤 @{profile['username']}\n"
+    text += f"📛 {profile['full_name']}\n"
+    text += f"📝 {profile['bio'][:100]}\n"
+    text += f"👥 {profile['follower_count']:,}\n"
+    text += f"📌 {profile['following_count']:,}\n"
+    text += f"📷 {profile['media_count']:,}\n"
     
     keyboard = [
-        [InlineKeyboardButton("✅ نعم، أرسل بلاغات", callback_data=f"confirm_{target}")],
-        [InlineKeyboardButton("❌ لا، خطأ", callback_data="cancel_report")]
+        [InlineKeyboardButton("✅ أرسل بلاغات", callback_data=f"confirm_{target}")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="cancel_report")]
     ]
-    update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
+    update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 def handle_message(update, context):
@@ -614,7 +539,7 @@ def handle_message(update, context):
     if step == 'report_target':
         target = extract_username(text)
         if not target or len(target) < 3:
-            update.message.reply_text("❌ *اسم مستخدم غير صالح*", parse_mode='Markdown')
+            update.message.reply_text("❌ *اسم غير صالح*", parse_mode='Markdown')
             return
         show_profile(update, context, target)
         context.user_data['step'] = 'confirm_report'
@@ -622,24 +547,20 @@ def handle_message(update, context):
     elif step == 'check_profile':
         target = extract_username(text)
         if not target or len(target) < 3:
-            update.message.reply_text("❌ *اسم مستخدم غير صالح*", parse_mode='Markdown')
+            update.message.reply_text("❌ *اسم غير صالح*", parse_mode='Markdown')
             return
         profile = profile_fetcher.get_profile_info(target)
         if profile:
             text = f"📸 *معلومات البروفايل*\n\n"
-            text += f"👤 *المستخدم:* @{profile['username']}\n"
-            text += f"📛 *الاسم:* {profile['full_name']}\n"
-            text += f"📝 *البايو:* {profile['bio'][:100]}...\n"
-            text += f"👥 *متابعون:* {profile['follower_count']:,}\n"
-            text += f"📌 *متابعة:* {profile['following_count']:,}\n"
-            text += f"📷 *منشورات:* {profile['media_count']:,}\n"
-            text += f"🔒 *خاص:* {'✅' if profile['is_private'] else '❌'}\n"
-            text += f"✅ *موثق:* {'✅' if profile['is_verified'] else '❌'}\n"
-            if profile.get('profile_pic_url'):
-                text += f"\n🖼️ [صورة البروفايل]({profile['profile_pic_url']})"
-            update.message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
+            text += f"👤 @{profile['username']}\n"
+            text += f"📛 {profile['full_name']}\n"
+            text += f"📝 {profile['bio'][:100]}\n"
+            text += f"👥 {profile['follower_count']:,}\n"
+            text += f"📌 {profile['following_count']:,}\n"
+            text += f"📷 {profile['media_count']:,}"
+            update.message.reply_text(text, parse_mode='Markdown')
         else:
-            update.message.reply_text("❌ *لا يمكن جلب معلومات البروفايل*", parse_mode='Markdown')
+            update.message.reply_text("❌ *مفيش حساب*", parse_mode='Markdown')
         context.user_data.clear()
 
 
@@ -649,9 +570,7 @@ def confirm_report(update, context):
     query.answer()
     
     query.edit_message_text(
-        f"🎯 *المستهدف:* @{target}\n\n"
-        f"🔄 *جاري إرسال البلاغات...*\n"
-        f"⏳ قد يستغرق بضع دقائق",
+        f"🎯 *المستهدف:* @{target}\n\n🔄 *جاري الإرسال...*",
         parse_mode='Markdown'
     )
     
@@ -661,22 +580,18 @@ def confirm_report(update, context):
     
     report_id = db.add_report(query.from_user.id, query.from_user.username or "N/A", target)
     
-    response = f"✅ *اكتمل الإرسال!*\n\n"
-    response += f"📋 رقم البلاغ: `#{report_id}`\n"
-    response += f"🎯 المستهدف: @{target}\n"
-    response += f"📊 النتائج:\n"
-    response += f"• ✅ نجح: {success}\n"
-    response += f"• ❌ فشل: {failed}\n"
-    response += f"• 📝 المجموع: {len(results)}"
-    if failed > 0:
-        response += "\n\n⚠️ *فشل بعض البلاغات*"
+    response = f"✅ *اكتمل!*\n\n"
+    response += f"📋 #{report_id}\n"
+    response += f"🎯 @{target}\n"
+    response += f"✅ نجح: {success}\n"
+    response += f"❌ فشل: {failed}"
     
     query.edit_message_text(
         response,
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")],
-            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back")]
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
         ])
     )
     context.user_data.clear()
@@ -686,7 +601,7 @@ def cancel_report(update, context):
     query = update.callback_query
     query.answer()
     context.user_data.clear()
-    query.edit_message_text("❌ *تم إلغاء البلاغ*", parse_mode='Markdown')
+    query.edit_message_text("❌ *تم الإلغاء*", parse_mode='Markdown')
 
 
 def back_handler(update, context):
@@ -696,14 +611,13 @@ def back_handler(update, context):
     keyboard = [
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("🔍 تحقق من حساب", callback_data="check_profile")],
-        [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
         [InlineKeyboardButton("🔧 إنشاء حساب مفعل", callback_data="create_accounts")],
         [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
         [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")]
     ]
     query.edit_message_text(
-        "🤖 *القائمة الرئيسية*\n\nاختر الإجراء المناسب:",
+        "🤖 *القائمة الرئيسية*",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -717,8 +631,6 @@ def callback_handler(update, context):
         report_start(update, context)
     elif data == "check_profile":
         check_profile_start(update, context)
-    elif data == "temp_email":
-        temp_email(update, context)
     elif data == "create_accounts":
         create_accounts(update, context)
     elif data == "random_account":
@@ -734,7 +646,7 @@ def callback_handler(update, context):
     elif data.startswith("confirm_"):
         confirm_report(update, context)
     else:
-        query.answer("❌ خيار غير معروف")
+        query.answer("❌")
 
 
 def main():
