@@ -10,7 +10,15 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 from fake_useragent import UserAgent
 from instagrapi import Client as InstaClient
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 import config
+import json
+import threading
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -113,7 +121,7 @@ class TempEmail:
         except:
             return []
     
-    def get_verification_code(self, max_wait=90):
+    def get_verification_code(self, max_wait=120):
         start = time.time()
         while time.time() - start < max_wait:
             emails = self.check_inbox()
@@ -133,34 +141,182 @@ class InstagramProfile:
     
     def get_profile_info(self, username):
         try:
-            url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            url = f"https://www.instagram.com/{username}/?__a=1"
             headers = {
-                'User-Agent': self.ua.random,
-                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'X-Requested-With': 'XMLHttpRequest',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'DNT': '1',
+                'Upgrade-Insecure-Requests': '1'
             }
-            response = requests.get(url, headers=headers)
+            
+            response = requests.get(url, headers=headers, timeout=10)
             
             if response.status_code == 200:
-                data = response.json()
-                user = data.get('data', {}).get('user', {})
-                if user:
-                    return {
-                        'username': user.get('username', 'N/A'),
-                        'full_name': user.get('full_name', 'N/A'),
-                        'bio': user.get('biography', 'لا يوجد'),
-                        'follower_count': user.get('edge_followed_by', {}).get('count', 0),
-                        'following_count': user.get('edge_follow', {}).get('count', 0),
-                        'media_count': user.get('edge_owner_to_timeline_media', {}).get('count', 0),
-                        'profile_pic_url': user.get('profile_pic_url_hd', ''),
-                        'is_private': user.get('is_private', False),
-                        'is_verified': user.get('is_verified', False)
-                    }
+                try:
+                    data = response.json()
+                    user = data.get('graphql', {}).get('user', {})
+                    if user:
+                        return self.format_user_data(user)
+                except:
+                    pass
+            
+            url2 = f"https://www.instagram.com/{username}/"
+            response = requests.get(url2, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                match = re.search(r'window\._sharedData = (.*?);</script>', response.text)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        user_data = data.get('entry_data', {}).get('ProfilePage', [{}])[0].get('graphql', {}).get('user', {})
+                        if user_data:
+                            return self.format_user_data(user_data)
+                    except:
+                        pass
+            
             return None
+            
         except Exception as e:
             logger.error(f"❌ فشل جلب البروفايل: {e}")
             return None
+    
+    def format_user_data(self, user):
+        return {
+            'username': user.get('username', 'N/A'),
+            'full_name': user.get('full_name', 'N/A'),
+            'bio': user.get('biography', 'لا يوجد'),
+            'follower_count': user.get('edge_followed_by', {}).get('count', 0),
+            'following_count': user.get('edge_follow', {}).get('count', 0),
+            'media_count': user.get('edge_owner_to_timeline_media', {}).get('count', 0),
+            'profile_pic_url': user.get('profile_pic_url_hd', user.get('profile_pic_url', '')),
+            'is_private': user.get('is_private', False),
+            'is_verified': user.get('is_verified', False)
+        }
+
+
+class InstagramCreator:
+    def __init__(self):
+        self.ua = UserAgent()
+    
+    def generate_random_data(self):
+        first_names = ['Ahmed', 'Mohamed', 'Sara', 'Nora', 'Omar', 'Layla', 'Khalid', 'Nadia', 'Youssef', 'Amina']
+        last_names = ['Ali', 'Hassan', 'Khalid', 'Saeed', 'Omar', 'Nasser', 'Ibrahim', 'Sultan', 'Rashid', 'Salem']
+        
+        first = random.choice(first_names)
+        last = random.choice(last_names)
+        
+        username = f"{first.lower()}{random.randint(100, 999)}{random.randint(10, 99)}"
+        password = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%", k=12))
+        email = f"{username}_{random.randint(1000, 9999)}@gmail.com"
+        
+        return {
+            'username': username,
+            'password': password,
+            'email': email,
+            'full_name': f"{first} {last}"
+        }
+    
+    def create_account_with_email(self):
+        """إنشاء حساب مع بريد مؤقت وتفعيل تلقائي"""
+        try:
+            # 1. توليد بيانات
+            data = self.generate_random_data()
+            
+            # 2. إنشاء بريد مؤقت
+            temp_email = TempEmail()
+            if not temp_email.create():
+                return None, "فشل إنشاء البريد المؤقت"
+            
+            email = temp_email.email
+            
+            # 3. إعداد المتصفح
+            options = webdriver.ChromeOptions()
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--headless')
+            options.add_argument(f'--user-agent={self.ua.random}')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+            options.add_argument('--window-size=1920,1080')
+            
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            # 4. فتح صفحة التسجيل
+            driver.get("https://www.instagram.com/accounts/emailsignup/")
+            time.sleep(3)
+            wait = WebDriverWait(driver, 10)
+            
+            # 5. ملء البيانات
+            email_input = wait.until(EC.presence_of_element_located((By.NAME, "emailOrPhone")))
+            email_input.send_keys(email)
+            time.sleep(1)
+            
+            name_input = driver.find_element(By.NAME, "fullName")
+            name_input.send_keys(data['full_name'])
+            time.sleep(1)
+            
+            username_input = driver.find_element(By.NAME, "username")
+            username_input.send_keys(data['username'])
+            time.sleep(1)
+            
+            password_input = driver.find_element(By.NAME, "password")
+            password_input.send_keys(data['password'])
+            time.sleep(1)
+            
+            signup_button = driver.find_element(By.XPATH, "//button[@type='submit']")
+            signup_button.click()
+            time.sleep(5)
+            
+            # 6. انتظار كود التفعيل
+            code = temp_email.get_verification_code(max_wait=120)
+            
+            if not code:
+                driver.quit()
+                return None, "لم يتم استلام كود التفعيل"
+            
+            # 7. إدخال كود التفعيل
+            try:
+                code_input = wait.until(EC.presence_of_element_located((By.NAME, "code")))
+                code_input.send_keys(code)
+                time.sleep(1)
+                
+                verify_button = driver.find_element(By.XPATH, "//button[@type='submit']")
+                verify_button.click()
+                time.sleep(5)
+                
+                # 8. حفظ الحساب
+                db.save_account(data['username'], data['password'], email)
+                
+                driver.quit()
+                return data, "تم إنشاء الحساب وتفعيله بنجاح ✅"
+                
+            except Exception as e:
+                driver.quit()
+                return None, f"فشل إدخال الكود: {e}"
+            
+        except Exception as e:
+            logger.error(f"❌ فشل إنشاء الحساب: {e}")
+            return None, str(e)
+    
+    def create_bulk(self, count=3):
+        accounts = []
+        for i in range(count):
+            logger.info(f"📌 إنشاء حساب {i+1}/{count}")
+            account, msg = self.create_account_with_email()
+            if account:
+                accounts.append(account)
+                logger.info(f"✅ {msg}")
+            else:
+                logger.error(f"❌ {msg}")
+            time.sleep(5)
+        return accounts
 
 
 class AutoReporter:
@@ -184,8 +340,9 @@ class AutoReporter:
         return results
 
 
-reporter = AutoReporter()
 profile_fetcher = InstagramProfile()
+reporter = AutoReporter()
+creator = InstagramCreator()
 
 
 def start(update, context):
@@ -193,6 +350,7 @@ def start(update, context):
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("🔍 تحقق من حساب", callback_data="check_profile")],
         [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
+        [InlineKeyboardButton("🔧 إنشاء حسابات مفعلة", callback_data="create_accounts")],
         [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
         [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")]
@@ -204,6 +362,7 @@ def start(update, context):
         "• 📝 إرسال بلاغات تلقائية\n"
         "• 🔍 التحقق من حساب إنستغرام\n"
         "• 📧 إنشاء بريد مؤقت\n"
+        "• 🔧 إنشاء حسابات مفعلة تلقائياً\n"
         "• 📤 عرض حساب عشوائي\n"
         "• 📋 عرض الحسابات المخزنة\n"
         "• 📊 متابعة بلاغاتك\n\n"
@@ -263,6 +422,38 @@ def temp_email(update, context):
         query.edit_message_text("❌ *فشل إنشاء البريد*", parse_mode='Markdown')
 
 
+def create_accounts(update, context):
+    query = update.callback_query
+    query.answer()
+    
+    query.edit_message_text(
+        "🔄 *جاري إنشاء 3 حسابات مفعلة...*\n"
+        "⏳ قد يستغرق بضع دقائق",
+        parse_mode='Markdown'
+    )
+    
+    accounts = creator.create_bulk(3)
+    
+    if accounts:
+        text = f"✅ *تم إنشاء {len(accounts)} حساب مفعل!*\n\n"
+        for acc in accounts:
+            text += f"👤 `{acc['username']}` | 🔑 `{acc['password']}`\n"
+        query.edit_message_text(
+            text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 عرض الحسابات", callback_data="my_accounts")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
+            ])
+        )
+    else:
+        query.edit_message_text(
+            "❌ *فشل إنشاء الحسابات*\n"
+            "حاول مرة أخرى لاحقاً.",
+            parse_mode='Markdown'
+        )
+
+
 def random_account(update, context):
     query = update.callback_query
     query.answer()
@@ -292,6 +483,8 @@ def my_accounts(update, context):
     text = "📋 *حساباتي*\n\n"
     for i, acc in enumerate(accounts[:10], 1):
         text += f"{i}. 👤 `{acc[0]}`\n   📧 {acc[2]}\n\n"
+    if len(accounts) > 10:
+        text += f"*و {len(accounts)-10} حسابات أخرى*"
     query.edit_message_text(text, parse_mode='Markdown')
 
 
@@ -307,6 +500,8 @@ def my_reports(update, context):
     for report in reports[:10]:
         status = "✅" if report[3] == "resolved" else "⏳"
         text += f"{status} #{report[0]} - @{report[2]}\n   📅 {report[4]}\n\n"
+    if len(reports) > 10:
+        text += f"*و {len(reports)-10} بلاغات أخرى*"
     query.edit_message_text(text, parse_mode='Markdown')
 
 
@@ -319,6 +514,7 @@ def extract_username(text):
                 return part.split('?')[0]
     if text.startswith('@'):
         text = text[1:]
+    text = re.sub(r'[^a-zA-Z0-9_.]', '', text)
     return text
 
 
@@ -350,7 +546,7 @@ def show_profile(update, context, target):
         [InlineKeyboardButton("✅ نعم، أرسل بلاغات", callback_data=f"confirm_{target}")],
         [InlineKeyboardButton("❌ لا، خطأ", callback_data="cancel_report")]
     ]
-    update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+    update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
 
 
 def handle_message(update, context):
@@ -359,7 +555,7 @@ def handle_message(update, context):
     
     if step == 'report_target':
         target = extract_username(text)
-        if not target:
+        if not target or len(target) < 3:
             update.message.reply_text("❌ *اسم مستخدم غير صالح*", parse_mode='Markdown')
             return
         show_profile(update, context, target)
@@ -367,7 +563,7 @@ def handle_message(update, context):
     
     elif step == 'check_profile':
         target = extract_username(text)
-        if not target:
+        if not target or len(target) < 3:
             update.message.reply_text("❌ *اسم مستخدم غير صالح*", parse_mode='Markdown')
             return
         profile = profile_fetcher.get_profile_info(target)
@@ -381,7 +577,9 @@ def handle_message(update, context):
             text += f"📷 *منشورات:* {profile['media_count']:,}\n"
             text += f"🔒 *خاص:* {'✅' if profile['is_private'] else '❌'}\n"
             text += f"✅ *موثق:* {'✅' if profile['is_verified'] else '❌'}\n"
-            update.message.reply_text(text, parse_mode='Markdown')
+            if profile.get('profile_pic_url'):
+                text += f"\n🖼️ [صورة البروفايل]({profile['profile_pic_url']})"
+            update.message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
         else:
             update.message.reply_text("❌ *لا يمكن جلب معلومات البروفايل*", parse_mode='Markdown')
         context.user_data.clear()
@@ -441,6 +639,7 @@ def back_handler(update, context):
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("🔍 تحقق من حساب", callback_data="check_profile")],
         [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
+        [InlineKeyboardButton("🔧 إنشاء حسابات مفعلة", callback_data="create_accounts")],
         [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
         [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")]
@@ -462,6 +661,8 @@ def callback_handler(update, context):
         check_profile_start(update, context)
     elif data == "temp_email":
         temp_email(update, context)
+    elif data == "create_accounts":
+        create_accounts(update, context)
     elif data == "random_account":
         random_account(update, context)
     elif data == "my_reports":
