@@ -10,7 +10,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 from fake_useragent import UserAgent
 from instagrapi import Client as InstaClient
-from selenium import webdriver
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -92,6 +92,10 @@ class Database:
         self.cursor.execute("SELECT username, password, email FROM accounts ORDER BY created_at DESC")
         return self.cursor.fetchall()
     
+    def delete_account(self, username):
+        self.cursor.execute("DELETE FROM accounts WHERE username = ?", (username,))
+        self.conn.commit()
+    
     def get_reports(self, user_id=None):
         if user_id:
             self.cursor.execute("SELECT * FROM reports WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
@@ -171,6 +175,85 @@ class TempEmail:
         
         return None
 
+# ================= جلب معلومات البروفايل =================
+
+class InstagramProfile:
+    def __init__(self):
+        self.ua = UserAgent()
+    
+    def get_profile_info(self, username):
+        """جلب معلومات البروفايل من إنستغرام"""
+        try:
+            # استخدام instagrapi للحصول على المعلومات
+            client = InstaClient()
+            
+            # محاولة جلب المعلومات من حساب مؤقت
+            # ملاحظة: لازم يكون في حساب مسجل دخول
+            accounts = db.get_accounts()
+            if accounts:
+                acc = accounts[0]
+                client.login(acc[0], acc[1])
+                user_id = client.user_id_from_username(username)
+                user_info = client.user_info(user_id)
+                client.logout()
+                
+                return {
+                    'username': user_info.username,
+                    'full_name': user_info.full_name,
+                    'bio': user_info.biography,
+                    'follower_count': user_info.follower_count,
+                    'following_count': user_info.following_count,
+                    'media_count': user_info.media_count,
+                    'profile_pic_url': user_info.profile_pic_url,
+                    'is_private': user_info.is_private,
+                    'is_verified': user_info.is_verified
+                }
+            else:
+                # لو مفيش حسابات، استخدم طلب HTTP عادي
+                return self.get_profile_via_web(username)
+                
+        except Exception as e:
+            logger.error(f"❌ فشل جلب معلومات البروفايل: {e}")
+            return None
+    
+    def get_profile_via_web(self, username):
+        """جلب المعلومات عبر الويب (بدون تسجيل دخول)"""
+        try:
+            url = f"https://www.instagram.com/{username}/"
+            headers = {
+                'User-Agent': self.ua.random
+            }
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                # استخراج البيانات من HTML
+                import json
+                import re
+                
+                # البحث عن البيانات في الصفحة
+                match = re.search(r'window\._sharedData = (.*?);</script>', response.text)
+                if match:
+                    data = json.loads(match.group(1))
+                    user_data = data['entry_data']['ProfilePage'][0]['graphql']['user']
+                    
+                    return {
+                        'username': user_data.get('username', 'N/A'),
+                        'full_name': user_data.get('full_name', 'N/A'),
+                        'bio': user_data.get('biography', 'لا يوجد'),
+                        'follower_count': user_data.get('edge_followed_by', {}).get('count', 0),
+                        'following_count': user_data.get('edge_follow', {}).get('count', 0),
+                        'media_count': user_data.get('edge_owner_to_timeline_media', {}).get('count', 0),
+                        'profile_pic_url': user_data.get('profile_pic_url_hd', ''),
+                        'is_private': user_data.get('is_private', False),
+                        'is_verified': user_data.get('is_verified', False)
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ فشل جلب المعلومات عبر الويب: {e}")
+            return None
+
 # ================= إنشاء حساب إنستغرام =================
 
 class InstagramCreator:
@@ -200,15 +283,18 @@ class InstagramCreator:
         try:
             data = self.generate_random_data()
             
-            options = webdriver.ChromeOptions()
+            options = uc.ChromeOptions()
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--headless')
             options.add_argument(f'--user-agent={self.ua.random}')
             options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
-            options.add_argument('--headless')
+            options.add_argument('--window-size=1920,1080')
             
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
+            driver = uc.Chrome(options=options)
             driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             driver.get("https://www.instagram.com/accounts/emailsignup/")
@@ -254,7 +340,7 @@ class InstagramCreator:
             account = self.create_account()
             if account:
                 accounts.append(account)
-            time.sleep(5)
+            time.sleep(10)
         return accounts
 
 # ================= إرسال البلاغات التلقائي =================
@@ -273,11 +359,6 @@ class AutoReporter:
         except Exception as e:
             logger.error(f"❌ فشل إضافة حساب {username}: {e}")
             return None
-    
-    def load_accounts_from_db(self):
-        accounts = db.get_accounts()
-        for acc in accounts:
-            self.add_account(acc[0], acc[1])
     
     def report_user(self, target_username):
         results = []
@@ -316,6 +397,7 @@ class AutoReporter:
 
 creator = InstagramCreator()
 reporter = AutoReporter()
+profile_fetcher = InstagramProfile()
 
 def start(update, context):
     keyboard = [
@@ -350,7 +432,8 @@ def help_command(update, context):
         "📝 *تقديم بلاغ:*\n"
         "1. اضغط على 'تقديم بلاغ'\n"
         "2. أرسل رابط أو اسم المستخدم\n"
-        "3. البوت يرسل بلاغات تلقائية من جميع الحسابات المخزنة\n\n"
+        "3. البوت يعرض معلومات البروفايل\n"
+        "4. تأكد من المستهدف ثم يرسل بلاغات تلقائية\n\n"
         "📧 *البريد المؤقت:*\n"
         "• إنشاء بريد مؤقت لاستقبال كود التفعيل\n\n"
         "🔧 *إنشاء حساب إنستغرام:*\n"
@@ -588,6 +671,48 @@ def extract_username(text):
     
     return text
 
+def show_profile(update, context, target):
+    """عرض معلومات البروفايل مع أزرار تأكيد"""
+    profile = profile_fetcher.get_profile_info(target)
+    
+    if not profile:
+        update.message.reply_text(
+            "❌ *لا يمكن جلب معلومات البروفايل*\n"
+            "تأكد من صحة اسم المستخدم أو حاول مرة أخرى.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # بناء رسالة البروفايل
+    profile_text = f"📸 *معلومات البروفايل*\n\n"
+    profile_text += f"👤 *المستخدم:* @{profile['username']}\n"
+    profile_text += f"📛 *الاسم:* {profile['full_name']}\n"
+    profile_text += f"📝 *البايو:* {profile['bio'][:100]}...\n"
+    profile_text += f"👥 *متابعون:* {profile['follower_count']:,}\n"
+    profile_text += f"📌 *متابعة:* {profile['following_count']:,}\n"
+    profile_text += f"📷 *منشورات:* {profile['media_count']:,}\n"
+    profile_text += f"🔒 *حساب خاص:* {'✅' if profile['is_private'] else '❌'}\n"
+    profile_text += f"✅ *موثق:* {'✅' if profile['is_verified'] else '❌'}\n"
+    
+    if profile.get('profile_pic_url'):
+        profile_text += f"\n🖼️ [صورة البروفايل]({profile['profile_pic_url']})"
+    
+    profile_text += f"\n\n❓ *هل هذا هو الحساب المستهدف؟*"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ نعم، هذا هو", callback_data=f"confirm_report_{target}")],
+        [InlineKeyboardButton("❌ لا، خطأ", callback_data="cancel_report")]
+    ]
+    
+    update.message.reply_text(
+        profile_text,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
+    
+    context.user_data['target'] = target
+
 def handle_message(update, context):
     text = update.message.text
     step = context.user_data.get('step')
@@ -604,41 +729,67 @@ def handle_message(update, context):
             )
             return
         
-        update.message.reply_text(
-            f"🎯 *المستهدف:* @{target}\n\n"
-            f"🔄 *جاري إرسال البلاغات التلقائية...*\n"
-            f"⏳ قد يستغرق بضع دقائق",
-            parse_mode='Markdown'
-        )
-        
-        results = reporter.report_user(target)
-        
-        success = len([r for r in results if r.get('status') == 'success'])
-        failed = len([r for r in results if r.get('status') == 'failed'])
-        
-        report_id = db.add_report(user.id, user.username or "N/A", target)
-        
-        response = f"✅ *اكتمل الإرسال!*\n\n"
-        response += f"📋 رقم البلاغ: `#{report_id}`\n"
-        response += f"🎯 المستهدف: @{target}\n"
-        response += f"📊 النتائج:\n"
-        response += f"• ✅ نجح: {success}\n"
-        response += f"• ❌ فشل: {failed}\n"
-        response += f"• 📝 المجموع: {len(results)}"
-        
-        if failed > 0:
-            response += f"\n\n⚠️ *فشل بعض البلاغات*\nقد تكون الحسابات محظورة أو غير نشطة."
-        
-        update.message.reply_text(
-            response,
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back")]
-            ])
-        )
-        
-        context.user_data.clear()
+        # عرض معلومات البروفايل
+        show_profile(update, context, target)
+        context.user_data['step'] = 'confirm_report'
+
+def confirm_report(update, context):
+    query = update.callback_query
+    target = query.data.replace("confirm_report_", "")
+    query.answer()
+    
+    query.edit_message_text(
+        f"🎯 *المستهدف:* @{target}\n\n"
+        f"🔄 *جاري إرسال البلاغات التلقائية...*\n"
+        f"⏳ قد يستغرق بضع دقائق",
+        parse_mode='Markdown'
+    )
+    
+    results = reporter.report_user(target)
+    
+    success = len([r for r in results if r.get('status') == 'success'])
+    failed = len([r for r in results if r.get('status') == 'failed'])
+    
+    report_id = db.add_report(
+        query.from_user.id,
+        query.from_user.username or "N/A",
+        target
+    )
+    
+    response = f"✅ *اكتمل الإرسال!*\n\n"
+    response += f"📋 رقم البلاغ: `#{report_id}`\n"
+    response += f"🎯 المستهدف: @{target}\n"
+    response += f"📊 النتائج:\n"
+    response += f"• ✅ نجح: {success}\n"
+    response += f"• ❌ فشل: {failed}\n"
+    response += f"• 📝 المجموع: {len(results)}"
+    
+    if failed > 0:
+        response += f"\n\n⚠️ *فشل بعض البلاغات*\nقد تكون الحسابات محظورة أو غير نشطة."
+    
+    query.edit_message_text(
+        response,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")],
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back")]
+        ])
+    )
+    
+    context.user_data.clear()
+
+def cancel_report(update, context):
+    query = update.callback_query
+    query.answer()
+    context.user_data.clear()
+    
+    query.edit_message_text(
+        "❌ *تم إلغاء البلاغ*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back")]
+        ])
+    )
 
 def back_handler(update, context):
     query = update.callback_query
@@ -681,6 +832,10 @@ def callback_handler(update, context):
         help_command(update, context)
     elif data == "back":
         back_handler(update, context)
+    elif data == "cancel_report":
+        cancel_report(update, context)
+    elif data.startswith("confirm_report_"):
+        confirm_report(update, context)
     else:
         query.answer("❌ خيار غير معروف")
 
