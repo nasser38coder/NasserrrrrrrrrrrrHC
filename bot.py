@@ -1,54 +1,21 @@
 import logging
 import re
 import time
-import json
 import sqlite3
-import os
-import subprocess
-import socket
-import ctypes
-import pickle
-import marshal
-import psutil
-import paramiko
+import random
+import string
 from datetime import datetime
-from threading import Thread
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
-from schedule import Scheduler
 import requests
-import aiohttp
-import httpx
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
-from pydantic import BaseModel, ValidationError
-from celery import Celery
-from redis import Redis
-from tenacity import retry, stop_after_attempt, wait_exponential
-from cloudscraper import create_scraper
-from tls_client import Session as TLSSession
-from curl_cffi import requests as curl_requests
-from webdriver_manager.chrome import ChromeDriverManager
-from pyppeteer import launch
-import scrapy
-from scrapy.crawler import CrawlerProcess
-from scrapy.selector import Selector
-from mailtm import Email
-from imap_tools import MailBox
-from faker import Faker
 from fake_useragent import UserAgent
-from undetected_chromedriver import Chrome
-from bs4 import BeautifulSoup
-import pyautogui
-from playwright.sync_api import sync_playwright
+from instagrapi import Client as InstaClient
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
-from instagrapi import Client as InstaClient
+from webdriver_manager.chrome import ChromeDriverManager
 import config
 
 # ================= إعدادات التسجيل =================
@@ -57,20 +24,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# ================= Pydantic Models =================
-
-class ReportData(BaseModel):
-    user_id: int
-    username: str
-    target: str
-    reason: str
-    status: str = "pending"
-
-class EmailData(BaseModel):
-    email: str
-    token: str
-    created_at: datetime
 
 # ================= قاعدة البيانات =================
 
@@ -87,7 +40,6 @@ class Database:
                 user_id INTEGER,
                 username TEXT,
                 target TEXT,
-                reason TEXT,
                 status TEXT DEFAULT 'pending',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -103,20 +55,21 @@ class Database:
         ''')
         
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sessions (
+            CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_type TEXT,
-                session_data TEXT,
+                username TEXT,
+                password TEXT,
+                email TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         self.conn.commit()
     
-    def add_report(self, user_id, username, target, reason):
+    def add_report(self, user_id, username, target):
         self.cursor.execute(
-            "INSERT INTO reports (user_id, username, target, reason) VALUES (?, ?, ?, ?)",
-            (user_id, username, target, reason)
+            "INSERT INTO reports (user_id, username, target) VALUES (?, ?, ?)",
+            (user_id, username, target)
         )
         self.conn.commit()
         return self.cursor.lastrowid
@@ -127,6 +80,17 @@ class Database:
             (email, token)
         )
         self.conn.commit()
+    
+    def save_account(self, username, password, email):
+        self.cursor.execute(
+            "INSERT INTO accounts (username, password, email) VALUES (?, ?, ?)",
+            (username, password, email)
+        )
+        self.conn.commit()
+    
+    def get_accounts(self):
+        self.cursor.execute("SELECT username, password, email FROM accounts ORDER BY created_at DESC")
+        return self.cursor.fetchall()
     
     def get_reports(self, user_id=None):
         if user_id:
@@ -207,110 +171,75 @@ class TempEmail:
         
         return None
 
-# ================= أدوات متقدمة =================
+# ================= إنشاء حساب إنستغرام =================
 
-class AdvancedTools:
+class InstagramCreator:
     def __init__(self):
-        self.fake = Faker()
-        self.ua = UserAgent()
-        self.scheduler = BackgroundScheduler()
-        self.scheduler.start()
-    
-    def get_random_headers(self):
-        return {
-            'User-Agent': self.ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
-    
-    def create_scraper_session(self):
-        return create_scraper()
-    
-    def create_tls_session(self):
-        return TLSSession()
-    
-    def create_curl_session(self):
-        return curl_requests.Session()
-    
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def retry_request(self, url):
-        headers = self.get_random_headers()
-        response = requests.get(url, headers=headers, timeout=10)
-        return response
-
-# ================= Instagram Account Creator =================
-
-class InstagramAccountCreator:
-    def __init__(self):
-        self.fake = Faker()
         self.ua = UserAgent()
         self.accounts = []
     
-    def setup_undetected_driver(self):
-        options = Chrome.options()
-        options.add_argument(f'--user-agent={self.ua.random}')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-        return Chrome(options=options)
-    
-    def generate_account_data(self):
-        first_name = self.fake.first_name()
-        last_name = self.fake.last_name()
-        username = f"{first_name.lower()}{self.fake.random_number(digits=4)}"
-        password = self.fake.password(length=12, special_chars=True, digits=True, upper_case=True, lower_case=True)
-        email = self.fake.email()
+    def generate_random_data(self):
+        first_names = ['Ahmed', 'Mohamed', 'Sara', 'Nora', 'Omar', 'Layla', 'Khalid', 'Nadia', 'Youssef', 'Amina']
+        last_names = ['Ali', 'Hassan', 'Khalid', 'Saeed', 'Omar', 'Nasser', 'Ibrahim', 'Sultan', 'Rashid', 'Salem']
+        
+        first = random.choice(first_names)
+        last = random.choice(last_names)
+        
+        username = f"{first.lower()}{random.randint(100, 999)}"
+        password = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%", k=12))
+        email = f"{username}_{random.randint(1000, 9999)}@gmail.com"
         
         return {
             'username': username,
             'password': password,
             'email': email,
-            'first_name': first_name,
-            'last_name': last_name
+            'full_name': f"{first} {last}"
         }
     
-    def create_account_selenium(self):
+    def create_account(self):
         try:
-            data = self.generate_account_data()
-            driver = self.setup_undetected_driver()
+            data = self.generate_random_data()
+            
+            options = webdriver.ChromeOptions()
+            options.add_argument(f'--user-agent={self.ua.random}')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+            options.add_argument('--headless')
+            
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             driver.get("https://www.instagram.com/accounts/emailsignup/")
             time.sleep(3)
             
             wait = WebDriverWait(driver, 10)
             
-            # إدخال البريد
             email_input = wait.until(EC.presence_of_element_located((By.NAME, "emailOrPhone")))
             email_input.send_keys(data['email'])
             time.sleep(1)
             
-            # إدخال الاسم الكامل
             name_input = driver.find_element(By.NAME, "fullName")
-            name_input.send_keys(f"{data['first_name']} {data['last_name']}")
+            name_input.send_keys(data['full_name'])
             time.sleep(1)
             
-            # إدخال اسم المستخدم
             username_input = driver.find_element(By.NAME, "username")
             username_input.send_keys(data['username'])
             time.sleep(1)
             
-            # إدخال كلمة المرور
             password_input = driver.find_element(By.NAME, "password")
             password_input.send_keys(data['password'])
             time.sleep(1)
             
-            # الضغط على تسجيل
             signup_button = driver.find_element(By.XPATH, "//button[@type='submit']")
             signup_button.click()
             time.sleep(5)
             
             driver.quit()
             
-            self.accounts.append(data)
+            db.save_account(data['username'], data['password'], data['email'])
+            
             logger.info(f"✅ تم إنشاء حساب: {data['username']}")
             return data
             
@@ -322,76 +251,92 @@ class InstagramAccountCreator:
         accounts = []
         for i in range(count):
             logger.info(f"📌 إنشاء حساب {i+1}/{count}")
-            account = self.create_account_selenium()
+            account = self.create_account()
             if account:
                 accounts.append(account)
             time.sleep(5)
         return accounts
 
-# ================= Instagram Reporter =================
+# ================= إرسال البلاغات التلقائي =================
 
-class InstagramReporter:
+class AutoReporter:
     def __init__(self):
         self.clients = []
-        self.fake = Faker()
-        self.ua = UserAgent()
     
     def add_account(self, username, password):
-        client = InstaClient()
-        client.login(username, password)
-        self.clients.append(client)
-        logger.info(f"✅ تم إضافة حساب: {username}")
-        return client
+        try:
+            client = InstaClient()
+            client.login(username, password)
+            self.clients.append(client)
+            logger.info(f"✅ تم إضافة حساب: {username}")
+            return client
+        except Exception as e:
+            logger.error(f"❌ فشل إضافة حساب {username}: {e}")
+            return None
+    
+    def load_accounts_from_db(self):
+        accounts = db.get_accounts()
+        for acc in accounts:
+            self.add_account(acc[0], acc[1])
     
     def report_user(self, target_username):
         results = []
-        for client in self.clients:
+        
+        accounts = db.get_accounts()
+        
+        if not accounts:
+            return [{'status': 'error', 'message': 'لا توجد حسابات مخزنة'}]
+        
+        for acc in accounts:
             try:
+                client = InstaClient()
+                client.login(acc[0], acc[1])
                 target_id = client.user_id_from_username(target_username)
                 client.report_user(target_id)
                 results.append({
-                    'account': client.username,
+                    'account': acc[0],
                     'target': target_username,
                     'status': 'success'
                 })
-                logger.info(f"✅ تم الإبلاغ عن {target_username} من {client.username}")
+                logger.info(f"✅ تم الإبلاغ عن {target_username} من {acc[0]}")
+                client.logout()
             except Exception as e:
                 results.append({
-                    'account': client.username,
+                    'account': acc[0],
                     'target': target_username,
                     'status': 'failed',
                     'error': str(e)
                 })
-                logger.error(f"❌ فشل الإبلاغ من {client.username}: {e}")
-            time.sleep(2)
+                logger.error(f"❌ فشل الإبلاغ من {acc[0]}: {e}")
+            time.sleep(random.randint(3, 7))
+        
         return results
 
 # ================= دوال البوت =================
 
-advanced_tools = AdvancedTools()
-account_creator = InstagramAccountCreator()
-instagram_reporter = InstagramReporter()
+creator = InstagramCreator()
+reporter = AutoReporter()
 
 def start(update, context):
     keyboard = [
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
         [InlineKeyboardButton("🔧 إنشاء حساب إنستغرام", callback_data="create_instagram")],
-        [InlineKeyboardButton("📤 إرسال بلاغات جماعية", callback_data="mass_report")],
+        [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
+        [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")],
-        [InlineKeyboardButton("🛡️ أدوات متقدمة", callback_data="advanced_tools")],
         [InlineKeyboardButton("❓ مساعدة", callback_data="help")]
     ]
     
     update.message.reply_text(
         "👋 *مرحباً بك في بوت Nasser HC Pro!*\n\n"
-        "🤖 *الميزات المتقدمة:*\n"
-        "• 📝 تسجيل بلاغات عن حسابات مخالفة\n"
+        "🤖 *الميزات:*\n"
+        "• 📝 إرسال بلاغات تلقائية عن حسابات مخالفة\n"
         "• 📧 إنشاء بريد مؤقت حقيقي\n"
-        "• 🔧 إنشاء حسابات إنستغرام تلقائياً\n"
-        "• 📤 إرسال بلاغات جماعية\n"
-        "• 🛡️ أدوات متقدمة (سكرابينج، تحليل، أتمتة)\n"
-        "• 📊 متابعة حالة بلاغاتك\n\n"
+        "• 🔧 إنشاء حساب إنستغرام تلقائياً\n"
+        "• 📤 عرض حساب عشوائي من المخزن\n"
+        "• 📋 عرض جميع الحسابات المخزنة\n"
+        "• 📊 متابعة بلاغاتك\n\n"
         "📌 *اختر أحد الأزرار:*",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -404,21 +349,16 @@ def help_command(update, context):
         "❓ *المساعدة*\n\n"
         "📝 *تقديم بلاغ:*\n"
         "1. اضغط على 'تقديم بلاغ'\n"
-        "2. أرسل اسم المستخدم المستهدف\n"
-        "3. أرسل سبب البلاغ\n\n"
+        "2. أرسل رابط أو اسم المستخدم\n"
+        "3. البوت يرسل بلاغات تلقائية من جميع الحسابات المخزنة\n\n"
         "📧 *البريد المؤقت:*\n"
-        "1. اضغط على 'بريد مؤقت'\n"
-        "2. سيتم إنشاء بريد لك\n"
-        "3. استخدمه للتسجيل\n\n"
+        "• إنشاء بريد مؤقت لاستقبال كود التفعيل\n\n"
         "🔧 *إنشاء حساب إنستغرام:*\n"
         "• ينشئ حساب تلقائياً ببيانات عشوائية\n\n"
-        "📤 *إرسال بلاغات جماعية:*\n"
-        "• يستخدم حسابات متعددة لإرسال بلاغات\n\n"
-        "🛡️ *أدوات متقدمة:*\n"
-        "• سكرابينج متقدم\n"
-        "• تحليل بيانات\n"
-        "• أتمتة المهام\n\n"
-        "للتواصل: @abdonaser27",
+        "📤 *حساب عشوائي:*\n"
+        "• يعرض حساب عشوائي من المخزن\n\n"
+        "📋 *حساباتي:*\n"
+        "• عرض جميع الحسابات المخزنة",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -429,8 +369,8 @@ def report_start(update, context):
     context.user_data['step'] = 'report_target'
     
     query.edit_message_text(
-        "✏️ *أرسل اسم المستخدم المستهدف:*\n"
-        "(بدون @)",
+        "✏️ *أرسل رابط الحساب أو اسم المستخدم:*\n"
+        "(مثال: https://instagram.com/username أو @username)",
         parse_mode='Markdown'
     )
 
@@ -504,7 +444,7 @@ def create_instagram_account(update, context):
         parse_mode='Markdown'
     )
     
-    account = account_creator.create_account_selenium()
+    account = creator.create_account()
     
     if account:
         query.edit_message_text(
@@ -512,16 +452,17 @@ def create_instagram_account(update, context):
             f"👤 المستخدم: `{account['username']}`\n"
             f"🔑 كلمة المرور: `{account['password']}`\n"
             f"📧 البريد: `{account['email']}`\n\n"
-            f"💡 احتفظ بهذه البيانات",
+            f"💡 تم حفظه في قاعدة البيانات",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 إضافة للحسابات", callback_data=f"add_account_{account['username']}")],
+                [InlineKeyboardButton("📋 عرض الحسابات", callback_data="my_accounts")],
                 [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
             ])
         )
     else:
         query.edit_message_text(
-            "❌ *فشل إنشاء الحساب*",
+            "❌ *فشل إنشاء الحساب*\n"
+            "حاول مرة أخرى لاحقاً.",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data="create_instagram")],
@@ -529,81 +470,71 @@ def create_instagram_account(update, context):
             ])
         )
 
-def mass_report_start(update, context):
-    query = update.callback_query
-    query.answer()
-    context.user_data['step'] = 'mass_report_target'
-    
-    query.edit_message_text(
-        "✏️ *أرسل اسم المستخدم المستهدف للإبلاغ الجماعي:*\n"
-        "(بدون @)",
-        parse_mode='Markdown'
-    )
-
-def advanced_tools_menu(update, context):
+def random_account(update, context):
     query = update.callback_query
     query.answer()
     
-    keyboard = [
-        [InlineKeyboardButton("🌐 سكرابينج متقدم", callback_data="scrape")],
-        [InlineKeyboardButton("📊 تحليل بيانات", callback_data="analyze")],
-        [InlineKeyboardButton("🤖 أتمتة المهام", callback_data="automate")],
-        [InlineKeyboardButton("🛡️ تغيير User-Agent", callback_data="change_ua")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
-    ]
+    accounts = db.get_accounts()
+    
+    if not accounts:
+        query.edit_message_text(
+            "📭 *لا توجد حسابات مخزنة*\n\n"
+            "قم بإنشاء حساب أولاً",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 إنشاء حساب", callback_data="create_instagram")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
+            ])
+        )
+        return
+    
+    account = random.choice(accounts)
     
     query.edit_message_text(
-        "🛡️ *الأدوات المتقدمة*\n\n"
-        "اختر الأداة المناسبة:",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-def scrape_tool(update, context):
-    query = update.callback_query
-    query.answer()
-    
-    query.edit_message_text(
-        "🌐 *أداة السكرابينج*\n\n"
-        "✏️ أرسل رابط الموقع لسحب بياناته:",
-        parse_mode='Markdown'
-    )
-    context.user_data['step'] = 'scrape'
-
-def analyze_tool(update, context):
-    query = update.callback_query
-    query.answer()
-    
-    query.edit_message_text(
-        "📊 *أداة تحليل البيانات*\n\n"
-        "📤 أرسل ملف البيانات (CSV/JSON) لتحليله:",
-        parse_mode='Markdown'
-    )
-    context.user_data['step'] = 'analyze'
-
-def automate_tool(update, context):
-    query = update.callback_query
-    query.answer()
-    
-    query.edit_message_text(
-        "🤖 *أداة الأتمتة*\n\n"
-        "✏️ أرسل المهمة المطلوب أتمتتها:",
-        parse_mode='Markdown'
-    )
-    context.user_data['step'] = 'automate'
-
-def change_ua(update, context):
-    query = update.callback_query
-    query.answer()
-    
-    ua = advanced_tools.ua.random
-    query.edit_message_text(
-        f"🛡️ *تم تغيير User-Agent*\n\n"
-        f"📌 الـ User-Agent الجديد:\n`{ua}`",
+        f"🎲 *حساب عشوائي من المخزن*\n\n"
+        f"👤 المستخدم: `{account[0]}`\n"
+        f"🔑 كلمة المرور: `{account[1]}`\n"
+        f"📧 البريد: `{account[2]}`",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 تغيير آخر", callback_data="change_ua")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="advanced_tools")]
+            [InlineKeyboardButton("🎲 عرض آخر", callback_data="random_account")],
+            [InlineKeyboardButton("📋 عرض الكل", callback_data="my_accounts")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
+        ])
+    )
+
+def my_accounts(update, context):
+    query = update.callback_query
+    query.answer()
+    
+    accounts = db.get_accounts()
+    
+    if not accounts:
+        query.edit_message_text(
+            "📭 *لا توجد حسابات مخزنة*",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 إنشاء حساب", callback_data="create_instagram")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
+            ])
+        )
+        return
+    
+    text = "📋 *حساباتي المخزنة*\n\n"
+    for i, acc in enumerate(accounts[:10], 1):
+        text += f"{i}. 👤 `{acc[0]}`\n"
+        text += f"   📧 {acc[2]}\n\n"
+    
+    if len(accounts) > 10:
+        text += f"*و {len(accounts)-10} حسابات أخرى*"
+    
+    query.edit_message_text(
+        text,
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔧 إنشاء جديد", callback_data="create_instagram")],
+            [InlineKeyboardButton("🎲 عرض عشوائي", callback_data="random_account")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
         ])
     )
 
@@ -627,10 +558,9 @@ def my_reports(update, context):
     
     text = "📊 *سجل بلاغاتي*\n\n"
     for report in reports[:10]:
-        status_emoji = "✅" if report[4] == "resolved" else "⏳"
+        status_emoji = "✅" if report[3] == "resolved" else "⏳"
         text += f"{status_emoji} #{report[0]} - @{report[2]}\n"
-        text += f"   📝 {report[3][:30]}...\n"
-        text += f"   📅 {report[5]}\n\n"
+        text += f"   📅 {report[4]}\n\n"
     
     if len(reports) > 10:
         text += f"*و {len(reports)-10} بلاغات أخرى*"
@@ -644,106 +574,70 @@ def my_reports(update, context):
         ])
     )
 
+def extract_username(text):
+    text = text.strip()
+    
+    if 'instagram.com/' in text:
+        parts = text.split('/')
+        for part in parts:
+            if part and not part in ['http:', 'https:', 'instagram.com', 'www']:
+                return part.split('?')[0]
+    
+    if text.startswith('@'):
+        text = text[1:]
+    
+    return text
+
 def handle_message(update, context):
     text = update.message.text
     step = context.user_data.get('step')
     user = update.effective_user
     
     if step == 'report_target':
-        context.user_data['target'] = text
-        context.user_data['step'] = 'report_reason'
+        target = extract_username(text)
+        
+        if not target:
+            update.message.reply_text(
+                "❌ *اسم مستخدم غير صالح*\n"
+                "يرجى إرسال رابط أو اسم مستخدم صحيح.",
+                parse_mode='Markdown'
+            )
+            return
         
         update.message.reply_text(
-            f"🎯 المستهدف: @{text}\n\n"
-            f"✏️ *أرسل سبب البلاغ:*",
+            f"🎯 *المستهدف:* @{target}\n\n"
+            f"🔄 *جاري إرسال البلاغات التلقائية...*\n"
+            f"⏳ قد يستغرق بضع دقائق",
             parse_mode='Markdown'
         )
-    
-    elif step == 'report_reason':
-        target = context.user_data.get('target', 'غير معروف')
-        reason = text
         
-        report_id = db.add_report(
-            user.id,
-            user.username or "N/A",
-            target,
-            reason
-        )
+        results = reporter.report_user(target)
         
-        context.user_data.clear()
+        success = len([r for r in results if r.get('status') == 'success'])
+        failed = len([r for r in results if r.get('status') == 'failed'])
+        
+        report_id = db.add_report(user.id, user.username or "N/A", target)
+        
+        response = f"✅ *اكتمل الإرسال!*\n\n"
+        response += f"📋 رقم البلاغ: `#{report_id}`\n"
+        response += f"🎯 المستهدف: @{target}\n"
+        response += f"📊 النتائج:\n"
+        response += f"• ✅ نجح: {success}\n"
+        response += f"• ❌ فشل: {failed}\n"
+        response += f"• 📝 المجموع: {len(results)}"
+        
+        if failed > 0:
+            response += f"\n\n⚠️ *فشل بعض البلاغات*\nقد تكون الحسابات محظورة أو غير نشطة."
         
         update.message.reply_text(
-            f"✅ *تم استلام بلاغك!*\n\n"
-            f"📋 رقم البلاغ: `#{report_id}`\n"
-            f"🎯 المستهدف: @{target}\n"
-            f"📝 السبب: {reason}",
+            response,
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")],
                 [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back")]
             ])
         )
-    
-    elif step == 'mass_report_target':
-        target = text
-        context.user_data.clear()
         
-        update.message.reply_text(
-            f"🔄 *جاري إرسال بلاغات جماعية لـ @{target}...*\n"
-            f"⏳ قد يستغرق بضع دقائق",
-            parse_mode='Markdown'
-        )
-        
-        # هنا كود الإبلاغ الجماعي
-        results = instagram_reporter.report_user(target)
-        
-        success = len([r for r in results if r.get('status') == 'success'])
-        failed = len([r for r in results if r.get('status') == 'failed'])
-        
-        update.message.reply_text(
-            f"✅ *اكتمل الإرسال!*\n\n"
-            f"📊 النتائج:\n"
-            f"• ✅ نجح: {success}\n"
-            f"• ❌ فشل: {failed}\n"
-            f"• 📝 المجموع: {len(results)}",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back")]
-            ])
-        )
-    
-    elif step == 'scrape':
-        update.message.reply_text(
-            "🌐 *جاري سحب البيانات...*\n⏳ انتظر قليلاً",
-            parse_mode='Markdown'
-        )
-        # هنا كود السكرابينج
-        update.message.reply_text(
-            "✅ *تم سحب البيانات بنجاح!*",
-            parse_mode='Markdown'
-        )
-        context.user_data.clear()
-    
-    elif step == 'analyze':
-        update.message.reply_text(
-            "📊 *جاري تحليل البيانات...*",
-            parse_mode='Markdown'
-        )
-        update.message.reply_text(
-            "✅ *تم تحليل البيانات!*",
-            parse_mode='Markdown'
-        )
-        context.user_data.clear()
-    
-    elif step == 'automate':
-        update.message.reply_text(
-            "🤖 *جاري تنفيذ المهمة...*",
-            parse_mode='Markdown'
-        )
-        update.message.reply_text(
-            "✅ *تم تنفيذ المهمة بنجاح!*",
-            parse_mode='Markdown'
-        )
         context.user_data.clear()
 
 def back_handler(update, context):
@@ -755,9 +649,9 @@ def back_handler(update, context):
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
         [InlineKeyboardButton("🔧 إنشاء حساب إنستغرام", callback_data="create_instagram")],
-        [InlineKeyboardButton("📤 إرسال بلاغات جماعية", callback_data="mass_report")],
+        [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
+        [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")],
-        [InlineKeyboardButton("🛡️ أدوات متقدمة", callback_data="advanced_tools")],
         [InlineKeyboardButton("❓ مساعدة", callback_data="help")]
     ]
     
@@ -777,28 +671,16 @@ def callback_handler(update, context):
         temp_email(update, context)
     elif data == "create_instagram":
         create_instagram_account(update, context)
-    elif data == "mass_report":
-        mass_report_start(update, context)
+    elif data == "random_account":
+        random_account(update, context)
     elif data == "my_reports":
         my_reports(update, context)
-    elif data == "advanced_tools":
-        advanced_tools_menu(update, context)
-    elif data == "scrape":
-        scrape_tool(update, context)
-    elif data == "analyze":
-        analyze_tool(update, context)
-    elif data == "automate":
-        automate_tool(update, context)
-    elif data == "change_ua":
-        change_ua(update, context)
+    elif data == "my_accounts":
+        my_accounts(update, context)
     elif data == "help":
         help_command(update, context)
     elif data == "back":
         back_handler(update, context)
-    elif data.startswith("add_account_"):
-        username = data.replace("add_account_", "")
-        query.answer(f"✅ تم إضافة {username}")
-        query.edit_message_text(f"✅ *تم إضافة {username} لقائمة الحسابات*", parse_mode='Markdown')
     else:
         query.answer("❌ خيار غير معروف")
 
