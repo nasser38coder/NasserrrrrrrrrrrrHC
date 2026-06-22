@@ -4,7 +4,7 @@ import time
 import sqlite3
 import random
 import string
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
@@ -16,6 +16,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
 import config
 import json
 import threading
@@ -61,7 +62,20 @@ class Database:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_creation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_attempt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'idle'
+            )
+        ''')
         self.conn.commit()
+        # التأكد من وجود سجل
+        self.cursor.execute("SELECT COUNT(*) FROM account_creation_log")
+        if self.cursor.fetchone()[0] == 0:
+            self.cursor.execute("INSERT INTO account_creation_log (last_attempt, status) VALUES (?, ?)", 
+                               (datetime.now() - timedelta(days=1), 'idle'))
+            self.conn.commit()
     
     def add_report(self, user_id, username, target):
         self.cursor.execute("INSERT INTO reports (user_id, username, target) VALUES (?, ?, ?)", (user_id, username, target))
@@ -86,6 +100,38 @@ class Database:
         else:
             self.cursor.execute("SELECT * FROM reports ORDER BY timestamp DESC LIMIT 20")
         return self.cursor.fetchall()
+    
+    def can_create_account(self):
+        """التحقق من إمكانية إنشاء حساب (مرة كل 24 ساعة)"""
+        self.cursor.execute("SELECT last_attempt, status FROM account_creation_log ORDER BY id DESC LIMIT 1")
+        result = self.cursor.fetchone()
+        if not result:
+            return True
+        last_attempt = datetime.fromisoformat(result[0])
+        status = result[1]
+        if status == 'success':
+            return False  # منع المحاولة بعد النجاح
+        # سماح بمحاولة واحدة كل 24 ساعة
+        if datetime.now() - last_attempt < timedelta(hours=24):
+            return False
+        return True
+    
+    def log_creation_attempt(self, status):
+        """تسجيل محاولة إنشاء حساب"""
+        self.cursor.execute("UPDATE account_creation_log SET last_attempt = ?, status = ?", 
+                           (datetime.now().isoformat(), status))
+        self.conn.commit()
+    
+    def get_creation_status(self):
+        """الحصول على حالة إنشاء الحساب"""
+        self.cursor.execute("SELECT last_attempt, status FROM account_creation_log ORDER BY id DESC LIMIT 1")
+        result = self.cursor.fetchone()
+        if result:
+            return {
+                'last_attempt': datetime.fromisoformat(result[0]),
+                'status': result[1]
+            }
+        return None
 
 
 db = Database()
@@ -140,10 +186,10 @@ class InstagramProfile:
         self.ua = UserAgent()
     
     def get_profile_info(self, username):
+        """جلب البروفايل من HTML مباشرة"""
         try:
-            url = f"https://www.instagram.com/{username}/?__a=1"
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': self.ua.random,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -152,49 +198,46 @@ class InstagramProfile:
                 'Upgrade-Insecure-Requests': '1'
             }
             
+            url = f"https://www.instagram.com/{username}/"
             response = requests.get(url, headers=headers, timeout=10)
             
             if response.status_code == 200:
-                try:
-                    data = response.json()
-                    user = data.get('graphql', {}).get('user', {})
-                    if user:
-                        return self.format_user_data(user)
-                except:
-                    pass
-            
-            url2 = f"https://www.instagram.com/{username}/"
-            response = requests.get(url2, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                match = re.search(r'window\._sharedData = (.*?);</script>', response.text)
-                if match:
-                    try:
-                        data = json.loads(match.group(1))
-                        user_data = data.get('entry_data', {}).get('ProfilePage', [{}])[0].get('graphql', {}).get('user', {})
-                        if user_data:
-                            return self.format_user_data(user_data)
-                    except:
-                        pass
-            
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # محاولة استخراج البيانات من script
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    if script.string and 'window._sharedData' in script.string:
+                        match = re.search(r'window\._sharedData = (.*?);</script>', str(script))
+                        if match:
+                            try:
+                                data = json.loads(match.group(1))
+                                user_data = data.get('entry_data', {}).get('ProfilePage', [{}])[0].get('graphql', {}).get('user', {})
+                                if user_data:
+                                    return {
+                                        'username': user_data.get('username', 'N/A'),
+                                        'full_name': user_data.get('full_name', 'N/A'),
+                                        'bio': user_data.get('biography', 'لا يوجد'),
+                                        'follower_count': user_data.get('edge_followed_by', {}).get('count', 0),
+                                        'following_count': user_data.get('edge_follow', {}).get('count', 0),
+                                        'media_count': user_data.get('edge_owner_to_timeline_media', {}).get('count', 0),
+                                        'profile_pic_url': user_data.get('profile_pic_url_hd', user_data.get('profile_pic_url', '')),
+                                        'is_private': user_data.get('is_private', False),
+                                        'is_verified': user_data.get('is_verified', False)
+                                    }
+                            except:
+                                pass
+                
+                # محاولة استخراج الصورة من HTML
+                img_tag = soup.find('img', {'alt': username})
+                if img_tag:
+                    profile_pic = img_tag.get('src', '')
+                
+                return None
             return None
-            
         except Exception as e:
             logger.error(f"❌ فشل جلب البروفايل: {e}")
             return None
-    
-    def format_user_data(self, user):
-        return {
-            'username': user.get('username', 'N/A'),
-            'full_name': user.get('full_name', 'N/A'),
-            'bio': user.get('biography', 'لا يوجد'),
-            'follower_count': user.get('edge_followed_by', {}).get('count', 0),
-            'following_count': user.get('edge_follow', {}).get('count', 0),
-            'media_count': user.get('edge_owner_to_timeline_media', {}).get('count', 0),
-            'profile_pic_url': user.get('profile_pic_url_hd', user.get('profile_pic_url', '')),
-            'is_private': user.get('is_private', False),
-            'is_verified': user.get('is_verified', False)
-        }
 
 
 class InstagramCreator:
@@ -220,14 +263,22 @@ class InstagramCreator:
         }
     
     def create_account_with_email(self):
-        """إنشاء حساب مع بريد مؤقت وتفعيل تلقائي"""
+        """إنشاء حساب واحد مع بريد مؤقت وتفعيل تلقائي"""
         try:
+            # التحقق من إمكانية الإنشاء
+            if not db.can_create_account():
+                status = db.get_creation_status()
+                if status:
+                    wait_time = 24 - (datetime.now() - status['last_attempt']).seconds // 3600
+                    return None, f"⚠️ يرجى الانتظار {wait_time} ساعة قبل المحاولة مرة أخرى"
+            
             # 1. توليد بيانات
             data = self.generate_random_data()
             
             # 2. إنشاء بريد مؤقت
             temp_email = TempEmail()
             if not temp_email.create():
+                db.log_creation_attempt('failed')
                 return None, "فشل إنشاء البريد المؤقت"
             
             email = temp_email.email
@@ -279,6 +330,7 @@ class InstagramCreator:
             
             if not code:
                 driver.quit()
+                db.log_creation_attempt('failed')
                 return None, "لم يتم استلام كود التفعيل"
             
             # 7. إدخال كود التفعيل
@@ -293,30 +345,20 @@ class InstagramCreator:
                 
                 # 8. حفظ الحساب
                 db.save_account(data['username'], data['password'], email)
+                db.log_creation_attempt('success')
                 
                 driver.quit()
-                return data, "تم إنشاء الحساب وتفعيله بنجاح ✅"
+                return data, "✅ تم إنشاء الحساب وتفعيله بنجاح!"
                 
             except Exception as e:
                 driver.quit()
+                db.log_creation_attempt('failed')
                 return None, f"فشل إدخال الكود: {e}"
             
         except Exception as e:
             logger.error(f"❌ فشل إنشاء الحساب: {e}")
+            db.log_creation_attempt('failed')
             return None, str(e)
-    
-    def create_bulk(self, count=3):
-        accounts = []
-        for i in range(count):
-            logger.info(f"📌 إنشاء حساب {i+1}/{count}")
-            account, msg = self.create_account_with_email()
-            if account:
-                accounts.append(account)
-                logger.info(f"✅ {msg}")
-            else:
-                logger.error(f"❌ {msg}")
-            time.sleep(5)
-        return accounts
 
 
 class AutoReporter:
@@ -350,7 +392,7 @@ def start(update, context):
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("🔍 تحقق من حساب", callback_data="check_profile")],
         [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
-        [InlineKeyboardButton("🔧 إنشاء حسابات مفعلة", callback_data="create_accounts")],
+        [InlineKeyboardButton("🔧 إنشاء حساب مفعل", callback_data="create_accounts")],
         [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
         [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")]
@@ -360,9 +402,9 @@ def start(update, context):
         "👋 *مرحباً بك في بوت Nasser HC Pro!*\n\n"
         "🤖 *الميزات:*\n"
         "• 📝 إرسال بلاغات تلقائية\n"
-        "• 🔍 التحقق من حساب إنستغرام\n"
+        "• 🔍 التحقق من حساب إنستغرام (HTML)\n"
         "• 📧 إنشاء بريد مؤقت\n"
-        "• 🔧 إنشاء حسابات مفعلة تلقائياً\n"
+        "• 🔧 إنشاء حساب مفعل (مرة كل 24 ساعة)\n"
         "• 📤 عرض حساب عشوائي\n"
         "• 📋 عرض الحسابات المخزنة\n"
         "• 📊 متابعة بلاغاتك\n\n"
@@ -426,18 +468,35 @@ def create_accounts(update, context):
     query = update.callback_query
     query.answer()
     
+    # التحقق من إمكانية الإنشاء
+    if not db.can_create_account():
+        status = db.get_creation_status()
+        if status:
+            wait_time = 24 - (datetime.now() - status['last_attempt']).seconds // 3600
+            query.edit_message_text(
+                f"⚠️ *لا يمكن إنشاء حساب جديد*\n\n"
+                f"📌 تم إنشاء حساب بالفعل.\n"
+                f"⏳ يرجى الانتظار {wait_time} ساعة للمحاولة مرة أخرى.",
+                parse_mode='Markdown'
+            )
+            return
+    
     query.edit_message_text(
-        "🔄 *جاري إنشاء 3 حسابات مفعلة...*\n"
-        "⏳ قد يستغرق بضع دقائق",
+        "🔄 *جاري إنشاء حساب مفعل...*\n"
+        "⏳ قد يستغرق 2-5 دقائق",
         parse_mode='Markdown'
     )
     
-    accounts = creator.create_bulk(3)
+    # إنشاء حساب واحد
+    account, msg = creator.create_account_with_email()
     
-    if accounts:
-        text = f"✅ *تم إنشاء {len(accounts)} حساب مفعل!*\n\n"
-        for acc in accounts:
-            text += f"👤 `{acc['username']}` | 🔑 `{acc['password']}`\n"
+    if account:
+        text = f"✅ *تم إنشاء حساب مفعل!*\n\n"
+        text += f"👤 المستخدم: `{account['username']}`\n"
+        text += f"🔑 كلمة المرور: `{account['password']}`\n"
+        text += f"📧 البريد: `{account['email']}`\n\n"
+        text += f"💡 سيتم استخدامه تلقائياً في الإبلاغ"
+        
         query.edit_message_text(
             text,
             parse_mode='Markdown',
@@ -448,8 +507,7 @@ def create_accounts(update, context):
         )
     else:
         query.edit_message_text(
-            "❌ *فشل إنشاء الحسابات*\n"
-            "حاول مرة أخرى لاحقاً.",
+            f"❌ *فشل إنشاء الحساب*\n\n{msg}",
             parse_mode='Markdown'
         )
 
@@ -639,7 +697,7 @@ def back_handler(update, context):
         [InlineKeyboardButton("📝 تقديم بلاغ", callback_data="report")],
         [InlineKeyboardButton("🔍 تحقق من حساب", callback_data="check_profile")],
         [InlineKeyboardButton("📧 بريد مؤقت", callback_data="temp_email")],
-        [InlineKeyboardButton("🔧 إنشاء حسابات مفعلة", callback_data="create_accounts")],
+        [InlineKeyboardButton("🔧 إنشاء حساب مفعل", callback_data="create_accounts")],
         [InlineKeyboardButton("📤 عرض حساب عشوائي", callback_data="random_account")],
         [InlineKeyboardButton("📋 حساباتي", callback_data="my_accounts")],
         [InlineKeyboardButton("📊 بلاغاتي", callback_data="my_reports")]
