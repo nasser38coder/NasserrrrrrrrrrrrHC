@@ -14,8 +14,6 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 import config
 
 # ================= إعدادات التسجيل =================
@@ -184,11 +182,8 @@ class InstagramProfile:
     def get_profile_info(self, username):
         """جلب معلومات البروفايل من إنستغرام"""
         try:
-            # استخدام instagrapi للحصول على المعلومات
             client = InstaClient()
             
-            # محاولة جلب المعلومات من حساب مؤقت
-            # ملاحظة: لازم يكون في حساب مسجل دخول
             accounts = db.get_accounts()
             if accounts:
                 acc = accounts[0]
@@ -209,7 +204,6 @@ class InstagramProfile:
                     'is_verified': user_info.is_verified
                 }
             else:
-                # لو مفيش حسابات، استخدم طلب HTTP عادي
                 return self.get_profile_via_web(username)
                 
         except Exception as e:
@@ -226,11 +220,9 @@ class InstagramProfile:
             response = requests.get(url, headers=headers)
             
             if response.status_code == 200:
-                # استخراج البيانات من HTML
                 import json
                 import re
                 
-                # البحث عن البيانات في الصفحة
                 match = re.search(r'window\._sharedData = (.*?);</script>', response.text)
                 if match:
                     data = json.loads(match.group(1))
@@ -683,7 +675,6 @@ def show_profile(update, context, target):
         )
         return
     
-    # بناء رسالة البروفايل
     profile_text = f"📸 *معلومات البروفايل*\n\n"
     profile_text += f"👤 *المستخدم:* @{profile['username']}\n"
     profile_text += f"📛 *الاسم:* {profile['full_name']}\n"
@@ -729,7 +720,6 @@ def handle_message(update, context):
             )
             return
         
-        # عرض معلومات البروفايل
         show_profile(update, context, target)
         context.user_data['step'] = 'confirm_report'
 
